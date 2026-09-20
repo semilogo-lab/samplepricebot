@@ -1,22 +1,27 @@
 """
 Crypto Price Alert Telegram Bot
 --------------------------------
-Lets users set price alerts for any coin listed on CoinGecko and get
-pinged in Telegram the moment the price crosses their target.
+Set a target price for any coin CoinGecko lists, get pinged in Telegram
+every time it's checked and the price is still past your target — the
+alert keeps firing until you remove it with /rm.
+
+If you go quiet for 5 days (no commands sent), the bot pauses your
+notifications rather than messaging someone who's stopped using it. It
+resumes automatically the moment you send anything again.
 
 Commands:
-    /start                          Welcome + quick instructions
-    /help                           Show command list
-    /price <symbol>                 Current price, e.g. /price btc
-    /alert <symbol> <above|below> <price>
-                                     Create an alert, e.g. /alert btc above 70000
-    /myalerts                       List your active alerts
-    /remove <id>                    Cancel one of your alerts
+    /start                          Welcome + how to use
+    /p <symbol>                     Current price, e.g. /p BTC
+    /a <symbol> <above|below> <price>
+                                     Create an alert, e.g. /a BTC above 70000
+    /my                              List your active alerts
+    /rm <id>                        Cancel an alert
 
 Storage: local SQLite file (alerts.db). Prices: CoinGecko public API.
 """
 
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -24,11 +29,7 @@ from contextlib import closing
 
 import requests
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # --------------------------------------------------------------------------
 # Config
@@ -37,6 +38,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "alerts.db")
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
+INACTIVITY_DAYS = int(os.environ.get("INACTIVITY_DAYS", "5"))
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 logging.basicConfig(
@@ -45,12 +47,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crypto-alert-bot")
 
-# In-memory cache: symbol (lowercase) -> coingecko coin id
-_SYMBOL_CACHE: dict[str, str] = {}
-
 
 # --------------------------------------------------------------------------
-# Database
+# Database — one table, four operations
 # --------------------------------------------------------------------------
 
 def init_db() -> None:
@@ -69,17 +68,23 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                last_seen INTEGER NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
 def add_alert(chat_id: int, symbol: str, coin_id: str, direction: str, target_price: float) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
-            """
-            INSERT INTO alerts (chat_id, symbol, coin_id, direction, target_price, active, created_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
-            """,
-            (chat_id, symbol.upper(), coin_id, direction, target_price, int(time.time())),
+            "INSERT INTO alerts (chat_id, symbol, coin_id, direction, target_price, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (chat_id, symbol, coin_id, direction, target_price, int(time.time())),
         )
         conn.commit()
         return cur.lastrowid
@@ -109,10 +114,30 @@ def all_active_alerts() -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM alerts WHERE active = 1").fetchall()
 
 
-def deactivate_alert(alert_id: int) -> None:
+def touch_user(chat_id: int) -> None:
+    """Record that this chat just interacted with the bot (any command or
+    message counts). Called on every update so 'last active' always
+    reflects the most recent thing they sent."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("UPDATE alerts SET active = 0 WHERE id = ?", (alert_id,))
+        conn.execute(
+            "INSERT INTO users (chat_id, last_seen) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET last_seen = excluded.last_seen",
+            (chat_id, int(time.time())),
+        )
         conn.commit()
+
+
+def get_last_seen(chat_ids: list[int]) -> dict[int, int]:
+    """Batch-fetch last-seen timestamps for a set of chats in one query."""
+    if not chat_ids:
+        return {}
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        placeholders = ",".join("?" for _ in chat_ids)
+        rows = conn.execute(
+            f"SELECT chat_id, last_seen FROM users WHERE chat_id IN ({placeholders})",
+            chat_ids,
+        ).fetchall()
+        return dict(rows)
 
 
 # --------------------------------------------------------------------------
@@ -120,38 +145,25 @@ def deactivate_alert(alert_id: int) -> None:
 # --------------------------------------------------------------------------
 
 def resolve_symbol(symbol: str) -> str | None:
-    """Map a ticker like 'btc' to a CoinGecko coin id like 'bitcoin'.
-
-    Uses CoinGecko's search endpoint and picks the top market-cap match,
-    since a symbol like ETH can technically map to multiple listed coins.
-    Result is cached in memory for the life of the process.
+    """Look up a ticker like 'btc' and return CoinGecko's coin id for it
+    ('bitcoin'). Trusts the top search result — CoinGecko ranks matches by
+    relevance/market cap, so the top hit is the coin most people mean.
     """
-    symbol = symbol.lower().strip()
-    if symbol in _SYMBOL_CACHE:
-        return _SYMBOL_CACHE[symbol]
-
     try:
-        resp = requests.get(f"{COINGECKO_BASE}/search", params={"query": symbol}, timeout=10)
+        resp = requests.get(
+            f"{COINGECKO_BASE}/search", params={"query": symbol}, timeout=10
+        )
         resp.raise_for_status()
         coins = resp.json().get("coins", [])
     except requests.RequestException as exc:
         logger.warning("CoinGecko search failed for %s: %s", symbol, exc)
         return None
 
-    # Prefer an exact symbol match, ranked by market cap (search already
-    # returns results ordered by relevance/market cap rank).
-    exact = [c for c in coins if c.get("symbol", "").lower() == symbol]
-    match = exact[0] if exact else (coins[0] if coins else None)
-    if not match:
-        return None
-
-    coin_id = match["id"]
-    _SYMBOL_CACHE[symbol] = coin_id
-    return coin_id
+    return coins[0]["id"] if coins else None
 
 
 def get_prices(coin_ids: list[str]) -> dict[str, float]:
-    """Batch-fetch USD prices for multiple coin ids in a single API call."""
+    """Batch-fetch USD prices for one or more CoinGecko coin ids."""
     if not coin_ids:
         return {}
     try:
@@ -175,52 +187,62 @@ def get_prices(coin_ids: list[str]) -> dict[str, float]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Crypto price alert bot.\n\n"
-        "/price btc — current price\n"
-        "/alert btc above 70000 — notify me when BTC goes above $70,000\n"
-        "/alert eth below 2000 — notify me when ETH drops below $2,000\n"
-        "/myalerts — list your active alerts\n"
-        "/remove <id> — cancel an alert\n\n"
+        "Commands:\n"
+        "/p (price) <symbol> - check a coin's current price\n"
+        "/a (alert) <symbol> <above|below> <price> - set a price alert\n"
+        "/my (my alerts) - list your active alerts\n"
+        "/rm (remove) <id> - cancel an alert\n\n"
+        "Note: once an alert hits, it keeps notifying you every check "
+        "while the price stays past your target — it only stops when "
+        f"you /rm it. If you don't use the bot for {INACTIVITY_DAYS} days, "
+        "notifications pause automatically until you're active again.\n\n"
+        "Examples:\n"
+        "/p BTC\n"
+        "/a BTC above 70000 - notify me when BTC goes above $70,000\n"
+        "/a ETH below 2000 - notify me when ETH drops below $2,000\n"
+        "/rm 3 - cancel alert #3\n\n"
         f"Prices are checked every {CHECK_INTERVAL_SECONDS} seconds."
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
-
-
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /price btc")
+        await update.message.reply_text("Usage: /p BTC")
         return
 
-    symbol = context.args[0]
+    symbol = context.args[0].upper()
     coin_id = resolve_symbol(symbol)
     if not coin_id:
         await update.message.reply_text(f"Couldn't find a coin matching '{symbol}'.")
         return
 
-    prices = get_prices([coin_id])
-    price = prices.get(coin_id)
+    price = get_prices([coin_id]).get(coin_id)
     if price is None:
         await update.message.reply_text("Price lookup failed, try again in a moment.")
         return
 
-    await update.message.reply_text(f"{symbol.upper()}: ${price:,.4f}")
+    await update.message.reply_text(f"{symbol}: ${price:,.4f}")
 
 
 async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if len(args) != 3 or args[1].lower() not in ("above", "below"):
         await update.message.reply_text(
-            "Usage: /alert <symbol> <above|below> <price>\nExample: /alert btc above 70000"
+            "Usage: /a <symbol> <above|below> <price>\nExample: /a BTC above 70000"
         )
         return
 
-    symbol, direction, price_str = args[0], args[1].lower(), args[2]
+    symbol = args[0].upper()
+    direction = args[1].lower()
+
     try:
-        target_price = float(price_str)
+        target_price = float(args[2])
     except ValueError:
-        await update.message.reply_text("Price must be a number, e.g. /alert btc above 70000")
+        await update.message.reply_text("Price must be a number, e.g. /a BTC above 70000")
+        return
+
+    if not math.isfinite(target_price) or target_price <= 0:
+        await update.message.reply_text("Price has to be a positive number, e.g. /a BTC above 70000")
         return
 
     coin_id = resolve_symbol(symbol)
@@ -230,14 +252,16 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     alert_id = add_alert(update.effective_chat.id, symbol, coin_id, direction, target_price)
     await update.message.reply_text(
-        f"Alert #{alert_id} set: {symbol.upper()} {direction} ${target_price:,.2f}"
+        f"Alert #{alert_id} set: {symbol} {direction} ${target_price:,.2f}\n"
+        f"I'll keep notifying you while it stays {direction} that price — "
+        f"send /rm {alert_id} when you want it to stop."
     )
 
 
 async def myalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_alerts(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("You have no active alerts. Set one with /alert.")
+        await update.message.reply_text("You have no active alerts. Set one with /a.")
         return
 
     lines = [
@@ -248,7 +272,7 @@ async def myalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /remove <id> — see /myalerts for ids.")
+        await update.message.reply_text("Usage: /rm <id> - see /my for ids.")
         return
 
     alert_id = int(context.args[0])
@@ -258,8 +282,19 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"No active alert #{alert_id} found for you.")
 
 
+async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("I didn't understand that. Send /start to see what I can do.")
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs on every single update, alongside whatever command handler
+    also fires, purely to stamp 'last seen' for this chat."""
+    if update.effective_chat:
+        touch_user(update.effective_chat.id)
+
+
 # --------------------------------------------------------------------------
-# Background job: check prices, fire alerts
+# Background job: check prices every interval, fire alerts that hit
 # --------------------------------------------------------------------------
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,33 +302,46 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not rows:
         return
 
-    coin_ids = [r["coin_id"] for r in rows]
-    prices = get_prices(coin_ids)
+    chat_ids = list({row["chat_id"] for row in rows})
+    last_seen = get_last_seen(chat_ids)
+    cutoff = time.time() - (INACTIVITY_DAYS * 86400)
+
+    prices = get_prices([r["coin_id"] for r in rows])
     if not prices:
         return
 
     for row in rows:
+        # Skip chats that have gone quiet for too long instead of
+        # messaging someone who isn't using the bot anymore. Resumes
+        # automatically the moment they send anything again.
+        if last_seen.get(row["chat_id"], 0) < cutoff:
+            continue
+
         price = prices.get(row["coin_id"])
         if price is None:
             continue
 
-        triggered = (
+        hit = (
             (row["direction"] == "above" and price >= row["target_price"])
             or (row["direction"] == "below" and price <= row["target_price"])
         )
-        if not triggered:
+        if not hit:
             continue
 
-        deactivate_alert(row["id"])
+        # No deactivation here on purpose: alerts keep firing on every check
+        # while the price stays past the target, and only stop when the
+        # user removes them with /rm.
+        if row["direction"] == "above":
+            phrase = f"price rise above ${row['target_price']:,.2f}"
+        else:
+            phrase = f"price drop to ${row['target_price']:,.2f}"
+
         try:
             await context.bot.send_message(
                 chat_id=row["chat_id"],
-                text=(
-                    f"🔔 {row['symbol']} is now ${price:,.4f} "
-                    f"({row['direction']} your target of ${row['target_price']:,.2f})"
-                ),
+                text=f"🔔 {row['symbol']} {phrase}\nNow at ${price:,.4f}",
             )
-        except Exception as exc:  # noqa: BLE001 - don't let one bad chat kill the loop
+        except Exception as exc:  # noqa: BLE001 - one bad chat shouldn't stop the rest
             logger.warning("Failed to notify chat %s: %s", row["chat_id"], exc)
 
 
@@ -313,16 +361,20 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("price", price_cmd))
-    app.add_handler(CommandHandler("alert", alert_cmd))
-    app.add_handler(CommandHandler("myalerts", myalerts_cmd))
-    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("p", price_cmd))
+    app.add_handler(CommandHandler("a", alert_cmd))
+    app.add_handler(CommandHandler("my", myalerts_cmd))
+    app.add_handler(CommandHandler("rm", remove_cmd))
+    app.add_handler(MessageHandler(filters.ALL, fallback))  # anything else
+    # Separate group so this runs on every update *in addition to* whatever
+    # handler above already processed it, instead of competing with them.
+    app.add_handler(MessageHandler(filters.ALL, track_activity), group=1)
 
     app.job_queue.run_repeating(check_alerts, interval=CHECK_INTERVAL_SECONDS, first=10)
 
     logger.info("Bot starting (checking prices every %ss)...", CHECK_INTERVAL_SECONDS)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
