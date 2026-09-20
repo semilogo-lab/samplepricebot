@@ -38,6 +38,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "alerts.db")
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
+RENOTIFY_COOLDOWN_SECONDS = int(os.environ.get("RENOTIFY_COOLDOWN_SECONDS", "180"))  # 3 min
 INACTIVITY_DAYS = int(os.environ.get("INACTIVITY_DAYS", "5"))
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
@@ -64,7 +65,8 @@ def init_db() -> None:
                 direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
                 target_price REAL NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                last_notified INTEGER
             )
             """
         )
@@ -112,6 +114,14 @@ def all_active_alerts() -> list[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute("SELECT * FROM alerts WHERE active = 1").fetchall()
+
+
+def mark_notified(alert_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE alerts SET last_notified = ? WHERE id = ?", (int(time.time()), alert_id)
+        )
+        conn.commit()
 
 
 def touch_user(chat_id: int) -> None:
@@ -180,6 +190,20 @@ def get_prices(coin_ids: list[str]) -> dict[str, float]:
         return {}
 
 
+def format_price(price: float) -> str:
+    """Format a USD price with enough decimals to actually show it.
+
+    Fixing this at 2 decimals works for BTC ($70,000.00) but silently
+    shows $0.00 for anything under a cent (plenty of altcoins live there,
+    e.g. $0.00086) - so coins under $1 get more decimal places, and
+    trailing zeros are trimmed to keep it readable.
+    """
+    if price >= 1:
+        return f"{price:,.2f}"
+    text = f"{price:,.8f}".rstrip("0")
+    return text if not text.endswith(".") else text + "0"
+
+
 # --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
@@ -192,10 +216,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/a (alert) <symbol> <above|below> <price> - set a price alert\n"
         "/my (my alerts) - list your active alerts\n"
         "/rm (remove) <id> - cancel an alert\n\n"
-        "Note: once an alert hits, it keeps notifying you every check "
-        "while the price stays past your target — it only stops when "
-        f"you /rm it. If you don't use the bot for {INACTIVITY_DAYS} days, "
-        "notifications pause automatically until you're active again.\n\n"
+        "Note: once an alert hits, it reminds you again roughly every "
+        f"{RENOTIFY_COOLDOWN_SECONDS // 60} minutes while the price stays "
+        "past your target — it only stops when you /rm it. If you don't "
+        f"use the bot for {INACTIVITY_DAYS} days, notifications pause "
+        "automatically until you're active again.\n\n"
         "Examples:\n"
         "/p BTC\n"
         "/a BTC above 70000 - notify me when BTC goes above $70,000\n"
@@ -221,7 +246,7 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Price lookup failed, try again in a moment.")
         return
 
-    await update.message.reply_text(f"{symbol}: ${price:,.4f}")
+    await update.message.reply_text(f"{symbol}: ${format_price(price)}")
 
 
 async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -252,9 +277,9 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     alert_id = add_alert(update.effective_chat.id, symbol, coin_id, direction, target_price)
     await update.message.reply_text(
-        f"Alert #{alert_id} set: {symbol} {direction} ${target_price:,.2f}\n"
-        f"I'll keep notifying you while it stays {direction} that price — "
-        f"send /rm {alert_id} when you want it to stop."
+        f"Alert #{alert_id} set: {symbol} {direction} ${format_price(target_price)}\n"
+        f"I'll remind you every {RENOTIFY_COOLDOWN_SECONDS // 60} min while it stays "
+        f"{direction} that price — send /rm {alert_id} when you want it to stop."
     )
 
 
@@ -265,7 +290,7 @@ async def myalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     lines = [
-        f"#{r['id']}: {r['symbol']} {r['direction']} ${r['target_price']:,.2f}" for r in rows
+        f"#{r['id']}: {r['symbol']} {r['direction']} ${format_price(r['target_price'])}" for r in rows
     ]
     await update.message.reply_text("Your active alerts:\n" + "\n".join(lines))
 
@@ -330,17 +355,24 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # No deactivation here on purpose: alerts keep firing on every check
         # while the price stays past the target, and only stop when the
-        # user removes them with /rm.
+        # user removes them with /rm. But we throttle how often a message
+        # actually goes out, so "keeps firing" doesn't mean "every 60s
+        # forever" - it means "reminds you periodically while it's true."
+        last_notified = row["last_notified"] or 0
+        if time.time() - last_notified < RENOTIFY_COOLDOWN_SECONDS:
+            continue
+
         if row["direction"] == "above":
-            phrase = f"price rise above ${row['target_price']:,.2f}"
+            phrase = f"price rise above ${format_price(row['target_price'])}"
         else:
-            phrase = f"price drop to ${row['target_price']:,.2f}"
+            phrase = f"price drop to ${format_price(row['target_price'])}"
 
         try:
             await context.bot.send_message(
                 chat_id=row["chat_id"],
-                text=f"🔔 {row['symbol']} {phrase}\nNow at ${price:,.4f}",
+                text=f"🔔 {row['symbol']} {phrase}\nNow at ${format_price(price)}",
             )
+            mark_notified(row["id"])
         except Exception as exc:  # noqa: BLE001 - one bad chat shouldn't stop the rest
             logger.warning("Failed to notify chat %s: %s", row["chat_id"], exc)
 
