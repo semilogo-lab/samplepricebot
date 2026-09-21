@@ -1,19 +1,15 @@
 """
 Crypto Price Alert Telegram Bot
 --------------------------------
-Set a target price for any coin CoinGecko lists. When the price gets there,
-you get a message. Keeps checking in periodically while it stays there,
-and pauses on its own if you go quiet for a few days.
+Everything after /start happens by tapping buttons - no other commands
+to remember. Set a target price for any coin CoinGecko lists; when the
+price gets there, you get a message. It keeps checking in periodically
+while it stays there, and pauses on its own if you go quiet for a while.
 
-Commands:
-    /start                  What this bot does
-    /p <symbol>             Check a price, e.g. /p BTC
-    /a <symbol> <price>     Set an alert, e.g. /a saga 0.034
-    /my                     See your alerts
-    /rm <number>            Remove one
-
-Alert numbers in /my always run 1, 2, 3... with no gaps - removing one
-shifts the rest down, so the numbers stay easy to read at a glance.
+/start is the only command. It shows a menu with three buttons:
+    Check Price   - look up a coin's current price
+    Set Alert     - pick a coin and a target price
+    My Alerts     - see your alerts, with a Remove button on each
 
 Storage: local SQLite file (alerts.db). Prices: CoinGecko public API.
 """
@@ -26,8 +22,15 @@ import time
 from contextlib import closing
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # --------------------------------------------------------------------------
 # Config
@@ -79,20 +82,19 @@ def init_db() -> None:
         conn.commit()
 
 
-def add_alert(chat_id: int, symbol: str, coin_id: str, target_price: float) -> int:
+def add_alert(chat_id: int, symbol: str, coin_id: str, target_price: float) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
+        conn.execute(
             "INSERT INTO alerts (chat_id, symbol, coin_id, target_price, active, created_at) "
             "VALUES (?, ?, ?, ?, 1, ?)",
             (chat_id, symbol, coin_id, target_price, int(time.time())),
         )
         conn.commit()
-        return cur.lastrowid
 
 
 def list_alerts(chat_id: int) -> list[sqlite3.Row]:
     """Active alerts for this chat, oldest first - this order is what
-    /my and /rm's numbering is built on."""
+    the on-screen numbering (#1, #2, ...) is built on."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(
@@ -100,14 +102,12 @@ def list_alerts(chat_id: int) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def remove_alert_by_db_id(chat_id: int, db_id: int) -> bool:
+def remove_alert_by_db_id(chat_id: int, db_id: int) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
-            "UPDATE alerts SET active = 0 WHERE id = ? AND chat_id = ? AND active = 1",
-            (db_id, chat_id),
+        conn.execute(
+            "UPDATE alerts SET active = 0 WHERE id = ? AND chat_id = ?", (db_id, chat_id)
         )
         conn.commit()
-        return cur.rowcount > 0
 
 
 def all_active_alerts() -> list[sqlite3.Row]:
@@ -125,7 +125,6 @@ def mark_notified(db_id: int) -> None:
 
 
 def touch_user(chat_id: int) -> None:
-    """Record that this chat just interacted with the bot."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             "INSERT INTO users (chat_id, last_seen) VALUES (?, ?) "
@@ -152,7 +151,6 @@ def get_last_seen(chat_ids: list[int]) -> dict[int, int]:
 # --------------------------------------------------------------------------
 
 def resolve_symbol(symbol: str) -> str | None:
-    """Look up a ticker like 'saga' and return CoinGecko's coin id for it."""
     try:
         resp = requests.get(
             f"{COINGECKO_BASE}/search", params={"query": symbol}, timeout=10
@@ -184,7 +182,6 @@ def get_prices(coin_ids: list[str]) -> dict[str, float]:
 
 
 def format_price(price: float) -> str:
-    """Show enough decimals that small prices don't just read as $0.00."""
     if price >= 1:
         return f"{price:,.2f}"
     text = f"{price:,.8f}".rstrip("0")
@@ -192,110 +189,191 @@ def format_price(price: float) -> str:
 
 
 def price_matches(price: float, target: float) -> bool:
-    """Close enough to the target to count as 'reached' - an exact match
-    on a live price practically never happens."""
     return abs(price - target) <= target * PRICE_MATCH_TOLERANCE
 
 
 # --------------------------------------------------------------------------
-# Command handlers
+# Keyboards
+# --------------------------------------------------------------------------
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💰 Check Price", callback_data="menu:price")],
+            [InlineKeyboardButton("🔔 Set Alert", callback_data="menu:alert")],
+            [InlineKeyboardButton("📋 My Alerts", callback_data="menu:myalerts")],
+        ]
+    )
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu:cancel")]])
+
+
+def alerts_keyboard(count: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"❌ Remove #{i}", callback_data=f"remove:{i}")]
+        for i in range(1, count + 1)
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# --------------------------------------------------------------------------
+# /start - the only command
 # --------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
     await update.message.reply_text(
-        "Crypto price alert bot.\n\n"
-        "/p <symbol> - check a price\n"
-        "/a <symbol> <price> - alert me at this price\n"
-        "/my - see your alerts\n"
-        "/rm <number> - remove an alert\n\n"
-        "Example: /a saga 0.034\n\n"
-        "I'll message you when it gets there, and check in again every "
-        "so often while it stays close."
+        "👋 Crypto price alert bot.\n\n"
+        "Check prices, set alerts, and I'll message you when they're "
+        "reached. Use the buttons below.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
-async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /p <symbol>")
-        return
+# --------------------------------------------------------------------------
+# Button taps
+# --------------------------------------------------------------------------
 
-    symbol = context.args[0].upper()
-    coin_id = resolve_symbol(symbol)
-    if not coin_id:
-        await update.message.reply_text(f"Couldn't find {symbol}.")
-        return
-
-    price = get_prices([coin_id]).get(coin_id)
-    if price is None:
-        await update.message.reply_text("Couldn't get the price, try again in a bit.")
-        return
-
-    await update.message.reply_text(f"{symbol}: ${format_price(price)}")
-
-
-async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /a <symbol> <price>\nExample: /a saga 0.034")
-        return
-
-    symbol = args[0].upper()
-
-    try:
-        target_price = float(args[1])
-    except ValueError:
-        await update.message.reply_text("Price must be a number, e.g. /a saga 0.034")
-        return
-
-    if not math.isfinite(target_price) or target_price <= 0:
-        await update.message.reply_text("Price has to be a positive number.")
-        return
-
-    coin_id = resolve_symbol(symbol)
-    if not coin_id:
-        await update.message.reply_text(f"Couldn't find {symbol}.")
-        return
-
-    add_alert(update.effective_chat.id, symbol, coin_id, target_price)
-    position = len(list_alerts(update.effective_chat.id))  # the one just added is last
-    await update.message.reply_text(
-        f"Alert #{position} set: {symbol} at ${format_price(target_price)}\n"
-        f"I'll let you know when it gets there."
-    )
-
-
-async def myalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = list_alerts(update.effective_chat.id)
+async def show_my_alerts(chat_id: int, edit_target) -> None:
+    """Renders the alerts list in place. edit_target is anything with an
+    async edit_message_text(...) method - here, always a callback query."""
+    rows = list_alerts(chat_id)
     if not rows:
-        await update.message.reply_text("No alerts yet. Set one with /a.")
+        await edit_target.edit_message_text(
+            "No alerts yet. Tap Set Alert to add one.", reply_markup=main_menu_keyboard()
+        )
         return
 
     lines = [
         f"#{i}: {r['symbol']} at ${format_price(r['target_price'])}"
         for i, r in enumerate(rows, start=1)
     ]
-    await update.message.reply_text("Your alerts:\n" + "\n".join(lines))
+    await edit_target.edit_message_text(
+        "Your alerts:\n" + "\n".join(lines), reply_markup=alerts_keyboard(len(rows))
+    )
 
 
-async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /rm <number> - see /my for the list.")
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    data = query.data
+
+    if data == "menu:cancel":
+        context.user_data.clear()
+        await query.edit_message_text("Main menu:", reply_markup=main_menu_keyboard())
         return
 
-    position = int(context.args[0])
-    rows = list_alerts(update.effective_chat.id)
-
-    if position < 1 or position > len(rows):
-        await update.message.reply_text(f"No alert #{position} - check /my.")
+    if data == "menu:price":
+        context.user_data.clear()
+        context.user_data["state"] = "awaiting_price_symbol"
+        await query.edit_message_text(
+            "Send me the coin symbol (e.g. BTC):", reply_markup=cancel_keyboard()
+        )
         return
 
-    target_row = rows[position - 1]
-    remove_alert_by_db_id(update.effective_chat.id, target_row["id"])
-    await update.message.reply_text(f"Alert #{position} removed.")
+    if data == "menu:alert":
+        context.user_data.clear()
+        context.user_data["state"] = "awaiting_alert_symbol"
+        await query.edit_message_text(
+            "Send me the coin symbol (e.g. BTC):", reply_markup=cancel_keyboard()
+        )
+        return
+
+    if data == "menu:myalerts":
+        context.user_data.clear()
+        await show_my_alerts(chat_id, query)
+        return
+
+    if data.startswith("remove:"):
+        position = int(data.split(":")[1])
+        rows = list_alerts(chat_id)
+        if 1 <= position <= len(rows):
+            remove_alert_by_db_id(chat_id, rows[position - 1]["id"])
+        await show_my_alerts(chat_id, query)
+        return
 
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("I didn't understand that. Send /start to see what I can do.")
+# --------------------------------------------------------------------------
+# Plain text replies - only meaningful while a button flow set a state
+# --------------------------------------------------------------------------
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = context.user_data.get("state")
+    text = update.message.text.strip()
+
+    if state == "awaiting_price_symbol":
+        symbol = text.upper()
+        coin_id = resolve_symbol(symbol)
+        context.user_data.clear()
+        if not coin_id:
+            await update.message.reply_text(
+                f"Couldn't find {symbol}.", reply_markup=main_menu_keyboard()
+            )
+            return
+        price = get_prices([coin_id]).get(coin_id)
+        if price is None:
+            await update.message.reply_text(
+                "Couldn't get the price, try again in a bit.", reply_markup=main_menu_keyboard()
+            )
+            return
+        await update.message.reply_text(
+            f"{symbol}: ${format_price(price)}", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    if state == "awaiting_alert_symbol":
+        symbol = text.upper()
+        coin_id = resolve_symbol(symbol)
+        if not coin_id:
+            await update.message.reply_text(
+                f"Couldn't find {symbol}. Try another symbol:", reply_markup=cancel_keyboard()
+            )
+            return  # stay in this state so they can retry
+        context.user_data["pending_symbol"] = symbol
+        context.user_data["pending_coin_id"] = coin_id
+        context.user_data["state"] = "awaiting_alert_price"
+        await update.message.reply_text(
+            f"What price should trigger the alert for {symbol}?", reply_markup=cancel_keyboard()
+        )
+        return
+
+    if state == "awaiting_alert_price":
+        try:
+            target_price = float(text)
+        except ValueError:
+            await update.message.reply_text(
+                "That's not a number - send the target price:", reply_markup=cancel_keyboard()
+            )
+            return
+        if not math.isfinite(target_price) or target_price <= 0:
+            await update.message.reply_text(
+                "Price has to be positive - send the target price:", reply_markup=cancel_keyboard()
+            )
+            return
+
+        symbol = context.user_data.pop("pending_symbol")
+        coin_id = context.user_data.pop("pending_coin_id")
+        context.user_data.clear()
+
+        add_alert(update.effective_chat.id, symbol, coin_id, target_price)
+        position = len(list_alerts(update.effective_chat.id))
+        await update.message.reply_text(
+            f"Alert #{position} set: {symbol} at ${format_price(target_price)}\n"
+            f"I'll let you know when it gets there.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # No pending flow - just re-show the menu instead of a bare "?" reply.
+    await update.message.reply_text("Use the buttons below:", reply_markup=main_menu_keyboard())
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Use the buttons below:", reply_markup=main_menu_keyboard())
 
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,7 +400,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for row in rows:
         if last_seen.get(row["chat_id"], 0) < inactivity_cutoff:
-            continue  # this chat has gone quiet, don't message them
+            continue
 
         price = prices.get(row["coin_id"])
         if price is None:
@@ -362,11 +440,9 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("p", price_cmd))
-    app.add_handler(CommandHandler("a", alert_cmd))
-    app.add_handler(CommandHandler("my", myalerts_cmd))
-    app.add_handler(CommandHandler("rm", remove_cmd))
-    app.add_handler(MessageHandler(filters.ALL, fallback))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.ALL, track_activity), group=1)
 
     app.job_queue.run_repeating(check_alerts, interval=CHECK_INTERVAL_SECONDS, first=10)
